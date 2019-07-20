@@ -44,17 +44,17 @@ __global__ void histogram_to_image(unsigned int *histogram, pixel *pixels,
   const int stride = blockDim.x;
   for (int i = index; i < w * h; i += stride) {
     if (histogram[i] > 0) {
-      pixels[i].r = 100;
-      pixels[i].g = 100;
-      pixels[i].b = 100;
+      pixels[i].r = 255;
+      pixels[i].g = 255;
+      pixels[i].b = 255;
     }
   }
 }
 
 int main(void) {
   const int num_particles = 100;
-  const int w = 7860;
-  const int h = 4320;
+  const int w = 1024*2;
+  const int h = 768*2;
 
   pixel *pixels;
   unsigned int *histogram;
