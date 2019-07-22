@@ -1,3 +1,4 @@
+#include <cmath>
 #include <cstring>
 #include <iostream>
 
@@ -8,7 +9,7 @@
 #include "stb_image_write.h"
 
 #define NUM_VARIATIONS 4
-#define NUM_XFORMS 3
+#define NUM_XFORMS 5
 
 struct affine {
   float a;
@@ -89,6 +90,13 @@ f->p1 += 2.0 * f->tx * f->ty * r;
 }
 */
 
+struct color {
+  float r;
+  float g;
+  float b;
+  float a;
+};
+
 __device__ particle apply_affine(const particle &in, const affine &a) {
   return {in.x * a.a + in.y * a.b + a.c, in.x * a.d + in.y * a.e + a.f};
 }
@@ -101,6 +109,7 @@ __global__ void sheep(int num_sheep, int iterations, hist *histogram, int w,
   curandState global_random_state;
   curand_init(index, 0, 0, &random_state);
   curand_init(0, 0, 0, &global_random_state);
+
   const int wait_time = 200;
 
   float total_weight = 0.0f;
@@ -115,6 +124,8 @@ __global__ void sheep(int num_sheep, int iterations, hist *histogram, int w,
                     curand_uniform(&random_state) * 2.0 - 1.0};
   state.x = 0;
   state.y = 0;
+
+  color c = {0.0, 0.0, 0.0, 1.0};
 
   // same starting point
   for (int iter = 0; iter < iterations && index < num_sheep; ++iter) {
@@ -132,14 +143,23 @@ __global__ void sheep(int num_sheep, int iterations, hist *histogram, int w,
     particle input = apply_affine(state, xform.pre_affine);
     particle next = {0., 0.};
 
-    var0_linear(input, &next, xform.weights[0]);
-    var1_sinusoidal(input, &next, xform.weights[1]);
-    var2_spherical(input, &next, xform.weights[2]);
-    var3_swirl(input, &next, xform.weights[3]);
+    if (xform.weights[0] >= 0)
+      var0_linear(input, &next, xform.weights[0]);
+    if (xform.weights[1] >= 0)
+      var1_sinusoidal(input, &next, xform.weights[1]);
+    if (xform.weights[2] >= 0)
+      var2_spherical(input, &next, xform.weights[2]);
+    if (xform.weights[3] >= 0)
+      var3_swirl(input, &next, xform.weights[3]);
 
     next = apply_affine(next, xform.post_affine);
 
     state = next;
+
+    c.r = (c.r + xform.r) / 2.0;
+    c.g = (c.g + xform.g) / 2.0;
+    c.b = (c.b + xform.b) / 2.0;
+    c.a = (c.a + xform.a) / 2.0;
 
     // TODO: Does atomicAdd prevent race condition?
     if (iter > wait_time) {
@@ -149,31 +169,66 @@ __global__ void sheep(int num_sheep, int iterations, hist *histogram, int w,
         atomicInc(&(histogram[iy * w + ix].count), 1);
 
         // race condition for color..., lets just try it
-        histogram[iy * w + ix].r = (xform.r + histogram[iy * w + ix].r) / 2.0f;
-        histogram[iy * w + ix].g = (xform.g + histogram[iy * w + ix].g) / 2.0f;
-        histogram[iy * w + ix].b = (xform.b + histogram[iy * w + ix].b) / 2.0f;
-        histogram[iy * w + ix].a = (xform.a + histogram[iy * w + ix].a) / 2.0f;
+        histogram[iy * w + ix].r =
+            c.r; // (xform.r + histogram[iy * w + ix].r) / 2.0f;
+        histogram[iy * w + ix].g =
+            c.g; //(xform.g + histogram[iy * w + ix].g) / 2.0f;
+        histogram[iy * w + ix].b =
+            c.b; //(xform.b + histogram[iy * w + ix].b) / 2.0f;
+        histogram[iy * w + ix].a =
+            c.a; //(xform.a + histogram[iy * w + ix].a) / 2.0f;
       }
     }
   }
 }
 
-__global__ void histogram_to_image(hist *histogram, pixel *pixels, int w,
-                                   int h) {
-  const int index = threadIdx.x;
-  const int stride = blockDim.x;
-  for (int i = index; i < w * h; i += stride) {
-    pixels[i].r = 0;
-    pixels[i].g = 0;
-    pixels[i].b = 0;
+__global__ void histogram_to_image(hist *histogram, pixel *pixels, int w, int h,
+                                   int image_w, int image_h, float max_freq) {
+  const int index = threadIdx.x + blockDim.x * blockIdx.x;
 
-    // we have an average
-    // lets map to ( val - average) / avarege +
-    if (histogram[i].count > 0) {
-      const float p = powf(histogram[i].a, 1.0f / 2.2f);
-      pixels[i].r = histogram[i].r * p * 255;
-      pixels[i].g = histogram[i].g * p * 255;
-      pixels[i].b = histogram[i].b * p * 255;
+  // Get x, y in histogram space.
+  // Get x and y in image space.
+  const int image_x = index % image_w;
+  const int image_y = index / image_w;
+
+  const int x = image_x * 3;
+  const int y = image_y * 3;
+
+  float tot_r = 0;
+  float tot_g = 0;
+  float tot_b = 0;
+  // float tot_a = 0;
+  float tot_count = 0;
+
+  if ((image_x < image_w) && (image_y < image_h)) {
+    // for now take average
+    for (int dx = -1; dx <= 1; ++dx) {
+      for (int dy = -1; dy <= 1; ++dy) {
+        if ((x + dx) > 0 && (x + dx) < w && (y + dy) > 0 && (y + dy) < h) {
+          const int i = (y + dy) * w + x + dx;
+          tot_r += histogram[i].r * histogram[i].count;
+          tot_g += histogram[i].g * histogram[i].count;
+          tot_b += histogram[i].b * histogram[i].count;
+          // tot_a += histogram[i].a;
+          tot_count += histogram[i].count;
+        }
+      }
+
+      if (tot_count > 0) {
+        float avg_freq = tot_count / 9.0f;
+        float avg_r = tot_r / tot_count;
+        float avg_g = tot_g / tot_count;
+        float avg_b = tot_b / tot_count;
+        // float avg_a = tot_a / 9.0f;
+        // float alpha = log(avg_freq) / log(max_freq);
+
+        // we have an average
+        // lets map to ( val - average) / avarege +
+        // const float p = powf(alpha, 1.0f / 10.0f);
+        pixels[index].r = avg_r * 255;
+        pixels[index].g = avg_g * 255;
+        pixels[index].b = avg_b * 255;
+      }
     }
   }
 }
@@ -216,12 +271,50 @@ void create_xforms(xform *xforms) {
   xforms[2].g = 0.0f;
   xforms[2].b = 0.0f;
   xforms[2].a = 1.0f;
+
+  xforms[2].weights[0] = 1.0;
+  xforms[2].weights[1] = 0.0;
+  xforms[2].weights[2] = 0.0;
+  xforms[2].weights[3] = 0.0;
+  xforms[2].weight = 33.0f;
+  xforms[2].pre_affine = affine{1.0, 0.0, 0.0, 1.0, 0.0, 0.0};
+  xforms[2].post_affine = affine{1.0, 0.0, 0.0, 0.0, 1.0, 0.0};
+  xforms[2].r = 1.0f;
+  xforms[2].g = 0.0f;
+  xforms[2].b = 0.0f;
+  xforms[2].a = 1.0f;
+
+  xforms[3].weights[0] = 1.0;
+  xforms[3].weights[1] = 0.0;
+  xforms[3].weights[2] = 0.0;
+  xforms[3].weights[3] = 0.0;
+  xforms[3].weight = 1.0f;
+  xforms[3].pre_affine = affine{-1.0, 0.0, 0.0, 0.0, 1.0, 0.0};
+  xforms[3].post_affine = affine{1.0, 0.0, 0.0, 0.0, 1.0, 0.0};
+  xforms[3].r = 0.0f;
+  xforms[3].g = 0.5f;
+  xforms[3].b = 0.5f;
+  xforms[3].a = 1.0f;
+
+  xforms[4].weights[0] = 0.0;
+  xforms[4].weights[1] = 0.0;
+  xforms[4].weights[2] = 0.0;
+  xforms[4].weights[3] = 1.0;
+  xforms[4].weight = 1.0f;
+  xforms[4].pre_affine = affine{1.0, 0.0, 0.0, 0.0, 1.0, 0.0};
+  xforms[4].post_affine = affine{1.0, 0.0, 0.0, 0.0, 1.0, 0.0};
+  xforms[4].r = 0.0f;
+  xforms[4].g = 0.5f;
+  xforms[4].b = 0.5f;
+  xforms[4].a = 1.0f;
 }
 
 int main(void) {
-  const int num_particles = 100000;
-  const int w = 1024;
-  const int h = 1024;
+  const int num_particles = 10000;
+  const int image_w = 1024;
+  const int image_h = 1024;
+  const int w = 1024 * 3;
+  const int h = 1024 * 3;
   const int num_threads = 1024;
   const int num_blocks = 100;
 
@@ -237,19 +330,31 @@ int main(void) {
   cudaDeviceSynchronize();
 
   // Allocate Unified Memory – accessible from CPU or GPU}
-  cudaMallocManaged(&pixels, w * h * sizeof(pixel));
+  cudaMallocManaged(&pixels, image_w * image_h * sizeof(pixel));
   cudaMallocManaged(&histogram, w * h * sizeof(hist));
 
   // Run kernel on 1M elements on the GPU
-  sheep<<<num_blocks, num_threads>>>(num_particles, 1000000, histogram, w, h,
+  sheep<<<num_blocks, num_threads>>>(num_particles, 8000000, histogram, w, h,
                                      xforms);
 
-  histogram_to_image<<<num_blocks, num_threads>>>(histogram, pixels, w, h);
+  cudaDeviceSynchronize();
+
+  // max freq
+  float max = 0;
+  for (int i = 0; i < w * h; ++i) {
+    if (histogram[i].count > max)
+      max = histogram[i].count;
+  }
+
+  std::cout << "got max freq " << max << std::endl;
+
+  histogram_to_image<<<1024 * 1024, num_threads>>>(histogram, pixels, w, h,
+                                                   image_w, image_h, max);
 
   // Wait for GPU to finish before accessing on host
   cudaDeviceSynchronize();
 
-  stbi_write_png("test2.png", w, h, 3, pixels, 0);
+  stbi_write_png("test2.png", image_w, image_h, 3, pixels, 0);
 
   // Free memory
   cudaFree(xforms);
